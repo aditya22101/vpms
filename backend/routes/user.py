@@ -1,7 +1,6 @@
 from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from database import db
-from models import User, ParkingLot, ParkingSpot, Reservation
+from database import db, User, ParkingLot, ParkingSpot, Reservation
 from extensions import redis_client, REDIS_AVAILABLE
 from datetime import datetime
 from utils.decorators import user_required
@@ -262,19 +261,65 @@ def release_parking(booking_id):
 @user_required
 def export_csv():
     try:
-        if not CELERY_AVAILABLE:
-            return jsonify({'message': 'CSV export service is not available'}), 503
+        import csv
+        import io
 
-        user_id = get_jwt_identity()
+        user_id = int(get_jwt_identity())
 
-        # Trigger async CSV export task
-        task = export_user_csv_task.delay(user_id)
+        # Get user's reservations
+        reservations = Reservation.query.filter_by(user_id=user_id).order_by(
+            Reservation.parking_timestamp.desc()
+        ).all()
 
-        return jsonify({
-            'message': 'CSV export initiated. You will be notified when ready.',
-            'task_id': task.id
-        }), 202
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        # Write header
+        writer.writerow([
+            'Reservation ID',
+            'Spot ID',
+            'Parking Lot',
+            'Address',
+            'Parking Timestamp',
+            'Leaving Timestamp',
+            'Duration (hours)',
+            'Cost (₹)',
+            'Status',
+            'Remarks'
+        ])
+
+        # Write data
+        for res in reservations:
+            spot = ParkingSpot.query.get(res.spot_id)
+            lot = ParkingLot.query.get(spot.lot_id) if spot else None
+
+            writer.writerow([
+                res.id,
+                res.spot_id,
+                lot.prime_location_name if lot else 'Unknown',
+                lot.address if lot else 'Unknown',
+                res.parking_timestamp.isoformat() if res.parking_timestamp else '',
+                res.leaving_timestamp.isoformat() if res.leaving_timestamp else 'Active',
+                res.get_duration_hours() if hasattr(res, 'get_duration_hours') else 0,
+                res.parking_cost,
+                'Active' if not res.leaving_timestamp else 'Completed',
+                res.remarks or ''
+            ])
+
+        # Create response with CSV file
+        output.seek(0)
+        filename = f'parking-history-{user_id}-{datetime.now().strftime("%Y%m%d")}.csv'
+
+        return send_file(
+            io.BytesIO(output.getvalue().encode('utf-8')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=filename
+        )
 
     except Exception as e:
-        return jsonify({'message': f'Error initiating export: {str(e)}'}), 500
+        print(f"Error in export_csv: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'message': f'Error exporting CSV: {str(e)}'}), 500
 

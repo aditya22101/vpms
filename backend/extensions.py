@@ -1,7 +1,4 @@
-from flask_sqlalchemy import SQLAlchemy
 import redis
-
-db = SQLAlchemy()
 
 # Redis client with error handling
 try:
