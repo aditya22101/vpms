@@ -86,8 +86,19 @@ def get_recent_activity():
 def get_parking_lots():
     """Get all parking lots"""
     try:
+        # Try to get from cache
+        cache_key = 'all_parking_lots'
+        cached = get_cached(cache_key)
+        if cached:
+            return jsonify(cached), 200
+
         lots = ParkingLot.query.all()
-        return jsonify([lot.to_dict() for lot in lots]), 200
+        result = [lot.to_dict() for lot in lots]
+
+        # Cache for 10 minutes (parking lots don't change often)
+        set_cached(cache_key, result, timeout=600)
+
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({'message': f'Error fetching parking lots: {str(e)}'}), 500
 
@@ -141,6 +152,8 @@ def create_parking_lot():
         try:
             if redis_client:
                 redis_client.delete('admin_stats')
+                redis_client.delete('all_parking_lots')
+                redis_client.delete('available_lots')
         except Exception:
             pass
 
@@ -223,6 +236,9 @@ def update_parking_lot(lot_id):
         if redis_client:
             try:
                 redis_client.delete('admin_stats')
+                redis_client.delete('all_parking_lots')
+                redis_client.delete('available_lots')
+                redis_client.delete(f'lot_{lot_id}_spots')
             except:
                 pass
 
@@ -253,9 +269,12 @@ def delete_parking_lot(lot_id):
         try:
             if redis_client:
                 redis_client.delete('admin_stats')
+                redis_client.delete('all_parking_lots')
+                redis_client.delete('available_lots')
+                redis_client.delete(f'lot_{lot_id}_spots')
         except Exception:
             pass
-        
+
         return jsonify({'message': 'Parking lot deleted successfully'}), 200
         
     except Exception as e:
@@ -268,8 +287,19 @@ def delete_parking_lot(lot_id):
 def get_parking_spots(lot_id):
     """Get all spots for a parking lot"""
     try:
+        # Try to get from cache
+        cache_key = f'lot_{lot_id}_spots'
+        cached = get_cached(cache_key)
+        if cached:
+            return jsonify(cached), 200
+
         spots = ParkingSpot.query.filter_by(lot_id=lot_id).all()
-        return jsonify([spot.to_dict() for spot in spots]), 200
+        result = [spot.to_dict() for spot in spots]
+
+        # Cache for 2 minutes (spot status changes on bookings)
+        set_cached(cache_key, result, timeout=120)
+
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({'message': f'Error fetching spots: {str(e)}'}), 500
 
@@ -279,8 +309,14 @@ def get_parking_spots(lot_id):
 def get_users():
     """Get all users"""
     try:
+        # Try to get from cache
+        cache_key = 'all_users_with_stats'
+        cached = get_cached(cache_key)
+        if cached:
+            return jsonify(cached), 200
+
         users = User.query.filter_by(role='user').all()
-        
+
         user_list = []
         for user in users:
             total_bookings = Reservation.query.filter_by(user_id=user.id).count()
@@ -288,11 +324,11 @@ def get_users():
                 user_id=user.id,
                 leaving_timestamp=None
             ).count()
-            
+
             total_spent = db.session.query(
                 db.func.sum(Reservation.parking_cost)
             ).filter_by(user_id=user.id).scalar() or 0
-            
+
             user_data = user.to_dict()
             user_data.update({
                 'total_bookings': total_bookings,
@@ -300,7 +336,10 @@ def get_users():
                 'total_spent': round(total_spent, 2)
             })
             user_list.append(user_data)
-        
+
+        # Cache for 5 minutes (user list changes rarely)
+        set_cached(cache_key, user_list, timeout=300)
+
         return jsonify(user_list), 200
     except Exception as e:
         return jsonify({'message': f'Error fetching users: {str(e)}'}), 500

@@ -167,7 +167,10 @@ def book_parking():
         if redis_client:
             redis_client.delete('available_lots')
             redis_client.delete(f'user_stats_{user_id}')
+            redis_client.delete(f'user_{user_id}_bookings')
             redis_client.delete('admin_stats')
+            redis_client.delete(f'lot_{lot.id}_spots')
+            redis_client.delete('all_users_with_stats')
 
         booking_data = reservation.to_dict()
         booking_data.update({
@@ -194,6 +197,13 @@ def book_parking():
 def get_user_bookings():
     try:
         user_id = int(get_jwt_identity())
+
+        # Try to get from cache
+        cache_key = f'user_{user_id}_bookings'
+        cached = get_cached(cache_key) if REDIS_AVAILABLE else None
+        if cached:
+            return jsonify(cached), 200
+
         reservations = Reservation.query.filter_by(user_id=user_id).order_by(Reservation.parking_timestamp.desc()).all()
 
         bookings = []
@@ -206,6 +216,10 @@ def get_user_bookings():
                 'address': lot.address if lot else 'Unknown'
             })
             bookings.append(booking_data)
+
+        # Cache for 2 minutes (changes when user books/releases)
+        if REDIS_AVAILABLE:
+            set_cached(cache_key, bookings, timeout=120)
 
         return jsonify(bookings), 200
 
@@ -241,7 +255,10 @@ def release_parking(booking_id):
         if redis_client:
             redis_client.delete('available_lots')
             redis_client.delete(f'user_stats_{user_id}')
+            redis_client.delete(f'user_{user_id}_bookings')
             redis_client.delete('admin_stats')
+            redis_client.delete(f'lot_{lot.id}_spots')
+            redis_client.delete('all_users_with_stats')
 
         reservation_data = reservation.to_dict()
         reservation_data['cost'] = reservation.parking_cost
@@ -255,7 +272,7 @@ def release_parking(booking_id):
         return jsonify({'message': f'Error releasing parking: {str(e)}'}), 500
 
 
-# ----------------- EXPORT CSV -----------------
+# ----------------- EXPORT CSV (Immediate Download) -----------------
 @user_bp.route('/export-csv', methods=['GET'])
 @jwt_required()
 @user_required
@@ -322,4 +339,96 @@ def export_csv():
         print(f"Error in export_csv: {str(e)}")
         print(traceback.format_exc())
         return jsonify({'message': f'Error exporting CSV: {str(e)}'}), 500
+
+
+# ----------------- EXPORT CSV (Async - Send via Email) -----------------
+@user_bp.route('/export-csv-async', methods=['POST'])
+@jwt_required()
+@user_required
+def export_csv_async():
+    """
+    Trigger async CSV export task.
+    The CSV will be generated in the background and sent via email.
+    """
+    try:
+        user_id = int(get_jwt_identity())
+
+        if not CELERY_AVAILABLE:
+            return jsonify({
+                'message': 'Async export not available. Celery is not configured.'
+            }), 503
+
+        # Get user info for response
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
+
+        if not user.email:
+            return jsonify({
+                'message': 'No email address on file. Please update your profile.'
+            }), 400
+
+        # Trigger async task
+        task = export_user_csv_task.apply_async(args=[user_id])
+
+        return jsonify({
+            'message': f'CSV export started. You will receive an email at {user.email} when ready.',
+            'task_id': task.id,
+            'email': user.email,
+            'status': 'processing'
+        }), 202  # 202 Accepted
+
+    except Exception as e:
+        print(f"Error in export_csv_async: {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'message': f'Error starting export: {str(e)}'}), 500
+
+
+# ----------------- CHECK CSV EXPORT STATUS -----------------
+@user_bp.route('/export-csv-status/<task_id>', methods=['GET'])
+@jwt_required()
+@user_required
+def check_csv_export_status(task_id):
+    """Check the status of an async CSV export task"""
+    try:
+        if not CELERY_AVAILABLE:
+            return jsonify({'message': 'Celery not available'}), 503
+
+        from celery.result import AsyncResult
+        task = AsyncResult(task_id, app=celery_app)
+
+        if task.state == 'PENDING':
+            response = {
+                'status': 'pending',
+                'message': 'Task is waiting to be processed'
+            }
+        elif task.state == 'STARTED':
+            response = {
+                'status': 'processing',
+                'message': 'CSV is being generated...'
+            }
+        elif task.state == 'SUCCESS':
+            result = task.result
+            response = {
+                'status': 'completed',
+                'message': result.get('message', 'CSV export completed'),
+                'filename': result.get('filename'),
+                'total_bookings': result.get('total_bookings', 0)
+            }
+        elif task.state == 'FAILURE':
+            response = {
+                'status': 'failed',
+                'message': str(task.info)
+            }
+        else:
+            response = {
+                'status': task.state.lower(),
+                'message': 'Unknown task state'
+            }
+
+        return jsonify(response), 200
+
+    except Exception as e:
+        print(f"Error checking task status: {str(e)}")
+        return jsonify({'message': f'Error checking status: {str(e)}'}), 500
 
