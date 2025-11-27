@@ -39,5 +39,9 @@ class Config:
     # Google Chat Webhook (for daily reminders)
     GOOGLE_CHAT_WEBHOOK_URL = os.environ.get('GOOGLE_CHAT_WEBHOOK_URL') or ''
 
+    # Daily Reminder Time Configuration (students can choose)
+    REMINDER_HOUR = int(os.environ.get('REMINDER_HOUR') or 18)  # Default: 6 PM
+    REMINDER_MINUTE = int(os.environ.get('REMINDER_MINUTE') or 0)  # Default: 0 minutes
+
 
 

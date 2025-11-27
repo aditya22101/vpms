@@ -161,12 +161,48 @@
           <div class="card-body text-center py-5">
             <i class="bi bi-file-earmark-spreadsheet text-info" style="font-size: 3rem;"></i>
             <h5 class="mt-3 mb-3">Export Booking History</h5>
-            <button class="btn btn-info" @click="exportCSV" :disabled="exporting">
-              <span v-if="exporting" class="spinner-border spinner-border-sm me-2"></span>
+            <p class="text-muted small mb-3">Download your complete parking history as CSV</p>
+            <button class="btn btn-info" @click="triggerExport" :disabled="exportStatus !== 'idle'">
+              <span v-if="exportStatus === 'processing'" class="spinner-border spinner-border-sm me-2"></span>
               <i v-else class="bi bi-download me-2"></i>
-              {{ exporting ? 'Exporting...' : 'Export CSV' }}
+              {{ exportButtonText }}
             </button>
+            <div v-if="exportStatus !== 'idle'" class="mt-3">
+              <div class="progress" style="height: 5px;">
+                <div
+                  class="progress-bar progress-bar-striped progress-bar-animated"
+                  :class="exportStatus === 'completed' ? 'bg-success' : 'bg-info'"
+                  role="progressbar"
+                  :style="{ width: exportProgress + '%' }"
+                ></div>
+              </div>
+              <small class="text-muted d-block mt-2">{{ exportStatusMessage }}</small>
+            </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Alert Notifications -->
+    <div class="position-fixed top-0 end-0 p-3" style="z-index: 11">
+      <div
+        v-for="(alert, index) in alerts"
+        :key="index"
+        class="toast show mb-2"
+        role="alert"
+      >
+        <div class="toast-header" :class="'bg-' + alert.type + ' text-white'">
+          <i class="bi me-2" :class="{
+            'bi-check-circle': alert.type === 'success',
+            'bi-exclamation-triangle': alert.type === 'warning',
+            'bi-info-circle': alert.type === 'info',
+            'bi-x-circle': alert.type === 'danger'
+          }"></i>
+          <strong class="me-auto">{{ alert.title }}</strong>
+          <button type="button" class="btn-close btn-close-white" @click="removeAlert(index)"></button>
+        </div>
+        <div class="toast-body">
+          {{ alert.message }}
         </div>
       </div>
     </div>
@@ -174,7 +210,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, onMounted, nextTick, computed, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import Chart from '../utils/chart'
 import { useAuthStore } from '../stores/auth'
@@ -184,7 +220,13 @@ const router = useRouter()
 const authStore = useAuthStore()
 
 const loading = ref(true)
-const exporting = ref(false)
+const exportStatus = ref<'idle' | 'processing' | 'completed' | 'failed'>('idle')
+const exportTaskId = ref<string | null>(null)
+const exportProgress = ref(0)
+const exportStatusMessage = ref('')
+const alerts = ref<Array<{ type: string, title: string, message: string }>>([])
+let pollingInterval: any = null
+
 const stats = ref({
   totalBookings: 0,
   activeBookings: 0,
@@ -194,6 +236,19 @@ const stats = ref({
 const activeBooking = ref<any>(null)
 const monthlyChart = ref<HTMLCanvasElement | null>(null)
 const lotUsageChart = ref<HTMLCanvasElement | null>(null)
+
+const exportButtonText = computed(() => {
+  switch (exportStatus.value) {
+    case 'processing':
+      return 'Exporting...'
+    case 'completed':
+      return 'Export Complete!'
+    case 'failed':
+      return 'Export Failed'
+    default:
+      return 'Export to CSV'
+  }
+})
 
 const loadDashboardData = async () => {
   try {
@@ -292,33 +347,116 @@ const releaseParking = async (bookingId: number) => {
   }
 }
 
-const exportCSV = async () => {
+// Alert notification system
+const showAlert = (type: string, title: string, message: string) => {
+  alerts.value.push({ type, title, message })
+  setTimeout(() => {
+    if (alerts.value.length > 0) {
+      alerts.value.shift()
+    }
+  }, 5000) // Auto-dismiss after 5 seconds
+}
+
+const removeAlert = (index: number) => {
+  alerts.value.splice(index, 1)
+}
+
+// Async CSV Export with batch job
+const triggerExport = async () => {
   try {
-    exporting.value = true
-    const response = await api.get('/user/export-csv', {
-      responseType: 'blob'
-    })
-    
-    // Create download link
-    const url = window.URL.createObjectURL(new Blob([response.data], { type: 'text/csv' }))
-    const link = document.createElement('a')
-    link.href = url
-    const filename = response.headers['content-disposition'] 
-      ? response.headers['content-disposition'].split('filename=')[1]?.replace(/"/g, '')
-      : `parking-history-${new Date().getTime()}.csv`
-    link.setAttribute('download', filename)
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    window.URL.revokeObjectURL(url)
-    
-    alert('CSV exported successfully!')
+    exportStatus.value = 'processing'
+    exportProgress.value = 10
+    exportStatusMessage.value = 'Initiating export batch job...'
+
+    showAlert('info', 'Export Started', 'Your CSV export batch job has been started. You will be notified when it\'s ready.')
+
+    // Trigger async export
+    const response = await api.post('/user/export-csv-async')
+    exportTaskId.value = response.data.task_id
+    exportProgress.value = 30
+    exportStatusMessage.value = 'Processing your booking history...'
+
+    // Start polling for status
+    startStatusPolling()
+
   } catch (error: any) {
     console.error('Export error:', error)
-    alert(error.response?.data?.message || 'Failed to export CSV. Please try again.')
-  } finally {
-    exporting.value = false
+    exportStatus.value = 'failed'
+    exportProgress.value = 0
+    exportStatusMessage.value = error.response?.data?.message || 'Failed to start export'
+
+    showAlert('danger', 'Export Failed', error.response?.data?.message || 'Failed to start CSV export. Please try again.')
+
+    // Reset after 3 seconds
+    setTimeout(() => {
+      exportStatus.value = 'idle'
+      exportStatusMessage.value = ''
+    }, 3000)
   }
+}
+
+// Poll for export status
+const startStatusPolling = () => {
+  if (pollingInterval) {
+    clearInterval(pollingInterval)
+  }
+
+  pollingInterval = setInterval(async () => {
+    try {
+      if (!exportTaskId.value) return
+
+      const response = await api.get(`/user/export-csv-status/${exportTaskId.value}`)
+      const status = response.data.status
+
+      if (status === 'processing') {
+        exportProgress.value = Math.min(exportProgress.value + 10, 90)
+        exportStatusMessage.value = 'Generating CSV file...'
+      } else if (status === 'completed') {
+        exportProgress.value = 100
+        exportStatus.value = 'completed'
+        exportStatusMessage.value = 'Export completed! Check your email.'
+
+        showAlert(
+          'success',
+          'Export Complete!',
+          `Your CSV file has been sent to your email. ${response.data.filename || ''}`
+        )
+
+        // Stop polling
+        clearInterval(pollingInterval)
+        pollingInterval = null
+
+        // Reset after 5 seconds
+        setTimeout(() => {
+          exportStatus.value = 'idle'
+          exportProgress.value = 0
+          exportStatusMessage.value = ''
+          exportTaskId.value = null
+        }, 5000)
+
+      } else if (status === 'failed') {
+        exportProgress.value = 0
+        exportStatus.value = 'failed'
+        exportStatusMessage.value = 'Export failed'
+
+        showAlert('danger', 'Export Failed', response.data.message || 'The export job failed. Please try again.')
+
+        // Stop polling
+        clearInterval(pollingInterval)
+        pollingInterval = null
+
+        // Reset after 3 seconds
+        setTimeout(() => {
+          exportStatus.value = 'idle'
+          exportStatusMessage.value = ''
+          exportTaskId.value = null
+        }, 3000)
+      }
+    } catch (error: any) {
+      console.error('Status polling error:', error)
+      // Don't stop polling on error, might be temporary
+    }
+  }, 3000) // Poll every 3 seconds
 }
 
 const formatDate = (dateString: string) => {
@@ -330,6 +468,13 @@ const formatDate = (dateString: string) => {
 onMounted(() => {
   loadDashboardData()
 })
+
+onUnmounted(() => {
+  // Clean up polling interval when component is destroyed
+  if (pollingInterval) {
+    clearInterval(pollingInterval)
+  }
+})
 </script>
 
 <style scoped>
@@ -339,6 +484,19 @@ onMounted(() => {
 
 .card:hover {
   transform: translateY(-5px);
+}
+
+.toast {
+  min-width: 300px;
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+}
+
+.toast-header {
+  border-bottom: none;
+}
+
+.progress {
+  background-color: rgba(0, 0, 0, 0.1);
 }
 </style>
 
